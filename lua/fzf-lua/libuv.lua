@@ -10,6 +10,9 @@ local __FILE__ = debug.getinfo(1, "S").source:gsub("^@", "")
 local base64 = require("fzf-lua.lib.base64")
 local serpent = require("fzf-lua.lib.serpent")
 
+---@param pid integer
+---@param signal integer?
+---@returns boolean
 local function process_kill(pid, signal)
   if not pid or not tonumber(pid) then return false end
   if type(uv.os_getpriority(pid)) == "number" then
@@ -47,7 +50,7 @@ local function coroutinify(fn)
   end
 end
 
----@param opts {cwd: string, cmd: string|table, env: table?, cb_finish: function, cb_write: function, cb_err: function, cb_pid: function, fn_transform: function?, EOL: string?, process1: boolean?, profiler: boolean?}
+---@param opts {cwd: string, cmd: string|table, env: table?, cb_finish: function, cb_write: function, cb_err: function, cb_pid: function, fn_transform: function?, EOL: string?, process1: boolean?, profiler: boolean?, use_queue: boolean?}
 ---@param fn_transform function?
 ---@param fn_done function?
 ---@return uv.uv_process_t proc
@@ -58,9 +61,15 @@ M.spawn = function(opts, fn_transform, fn_done)
   local error_pipe = uv.new_pipe(false)
   local write_cb_count, read_cb_count, on_exit_called = 0, 0, nil
   local prev_line_content = nil
+  local handle, pid
+  local co = coroutine.running()
+  local queue = require("fzf-lua.lib.queue").new()
 
-  if opts.fn_transform then fn_transform = opts.fn_transform end
+  -- Disable queue if running headless due to
+  -- "Attempt to yield across a C-call boundary"
+  opts.use_queue = not _G._fzf_lua_is_headless and opts.use_queue
 
+  ---@diagnostic disable-next-line: redefined-local
   local finish = function(code, sig, from, pid)
     -- Uncomment to debug pipe closure timing issues (#1521)
     -- output_pipe:close(function() print("closed o") end)
@@ -70,10 +79,17 @@ M.spawn = function(opts, fn_transform, fn_done)
     if opts.cb_finish then
       opts.cb_finish(code, sig, from, pid)
     end
-    -- coroutinify callback
-    if fn_done then
-      fn_done(pid)
+    queue:clear()
+    if not handle:is_closing() then
+      handle:kill("sigterm")
+      vim.defer_fn(function()
+        if not handle:is_closing() then
+          handle:kill("sigkill")
+        end
+      end, 200)
     end
+    -- NO LONGER USED, was coroutinify callback
+    if fn_done then fn_done(pid) end
   end
 
   -- https://github.com/luvit/luv/blob/master/docs.md
@@ -91,7 +107,6 @@ M.spawn = function(opts, fn_transform, fn_done)
     table.insert(args, tostring(opts.cmd))
   end
 
-  local handle, pid
   ---@diagnostic disable-next-line: missing-fields
   handle, pid = uv.spawn(shell, {
     args = args,
@@ -150,23 +165,21 @@ M.spawn = function(opts, fn_transform, fn_done)
     end)
   end
 
-  local _read_cb = function(err, data)
-    if err then
-      assert(not err)
-      finish(130, 0, 4, pid)
-    end
+  --- Called with nil to process the leftover data
+  ---@param data string?
+  local process_data = function(data)
+    data = data or prev_line_content and (prev_line_content .. EOL) or nil
     if not data then
-      if prev_line_content then
-        write_cb(prev_line_content .. EOL)
-      end
       -- https://github.com/LazyVim/LazyVim/discussions/5264
       -- The pipe can remain active *after* on_exit was called
-      if write_cb_count == 0 and on_exit_called then
+      if write_cb_count == 0
+          and read_cb_count == 0
+          and on_exit_called
+      then
         finish(0, 0, 5, pid)
       end
       return
     end
-
     if not fn_transform then
       write_cb(data)
     else
@@ -219,13 +232,26 @@ M.spawn = function(opts, fn_transform, fn_done)
   end
 
   local read_cb = function(err, data)
-    read_cb_count = read_cb_count + 1
-    local read = function()
-      _read_cb(err, data)
-      read_cb_count = read_cb_count - 1
+    if err then
+      finish(130, 0, 4, pid)
+      return
     end
-    -- Avoid "attempt to yield across C-call boundary"
-    if vim.in_fast_event() then vim.schedule(read) else read() end
+    if opts.use_queue then
+      if data then
+        queue:push(data)
+        coroutine.resume(co)
+      end
+    else
+      -- Schedule data processing, will call finish if data is nil
+      -- and no leftover data is present
+      read_cb_count = read_cb_count + 1
+      local process = coroutine.wrap(function()
+        read_cb_count = read_cb_count - 1
+        process_data(data)
+      end)
+      -- Avoid "attempt to yield across C-call boundary" by using vim.schedule
+      if vim.in_fast_event() then vim.schedule(process) else process() end
+    end
   end
 
   local err_cb = function(err, data)
@@ -252,9 +278,23 @@ M.spawn = function(opts, fn_transform, fn_done)
     output_pipe:read_start(read_cb)
     error_pipe:read_start(err_cb)
   end
+
+  if opts.use_queue then
+    while not (output_pipe:is_closing() and queue:empty()) do
+      if queue:empty() then
+        coroutine.yield()
+      else
+        process_data(queue:pop())
+      end
+    end
+    -- process the leftover line from `processs_data`
+    process_data(nil)
+  end
+
   return handle, pid
 end
 
+-- Coroutine version of spawn so we can use queue
 M.async_spawn = coroutinify(M.spawn)
 
 ---@param opts {cmd: string, cwd: string, cb_pid: function, cb_finish: function, cb_write: function, multiline: boolean?, process1: boolean?, profiler: boolean?}

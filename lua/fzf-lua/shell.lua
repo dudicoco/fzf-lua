@@ -324,10 +324,9 @@ M.stringify = function(contents, opts, fzf_field_index)
       end
     end
 
-    local on_write = function(data, cb, co)
+    local on_write = function(data, cb)
       -- pipe can be nil when using a shell command with spawn
       -- and typing quickly, the process will terminate
-      assert(not co or (co and pipe and not uv.is_closing(pipe)))
       if not pipe then return end
       if not data then
         on_finish(nil, nil, 5)
@@ -336,7 +335,6 @@ M.stringify = function(contents, opts, fzf_field_index)
         write_cb_count = write_cb_count + 1
         uv.write(pipe, tostring(data), function(err)
           write_cb_count = write_cb_count - 1
-          if co then coroutine.resume(co) end
           if cb then cb(err) end
           if err then
             -- force close on error
@@ -347,14 +345,6 @@ M.stringify = function(contents, opts, fzf_field_index)
             on_finish(nil, nil, 3)
           end
         end)
-        -- yield returns when uv.write completes
-        -- or when a new coroutine calls resume(1)
-        if co and coroutine.yield() == 1 then
-          -- we have a new routine in opts.__co, this
-          -- routine is no longer relevant so kill it
-          write_cb_count = 0
-          on_finish(nil, nil, 4)
-        end
       end
     end
 
@@ -378,62 +368,25 @@ M.stringify = function(contents, opts, fzf_field_index)
         cb_pid = function(pid) if opts.PidObject then opts.PidObject:set(pid) end end,
         process1 = opts.process1,
         profiler = opts.profiler,
+        use_queue = opts.use_queue == nil and true or opts.use_queue,
         EOL = EOL,
         -- must send false, 'coroutinify' adds callback as last argument
         -- which will conflict with the 'fn_transform' argument
         -- convert `fn_transform(x)` to `fn_transform(x, opts)`
       }, fn_transform and function(x) return fn_transform(x, opts) end or false)
     else
-      local fn_load = function()
-        if opts.__co then
-          local costatus = coroutine.status(opts.__co)
-          if costatus ~= "dead" then
-            -- the previous routine is either 'running' or 'suspended'
-            -- return 1 from yield to signal abort to 'on_write'
-            coroutine.resume(opts.__co, 1)
-          end
-          assert(coroutine.status(opts.__co) == "dead")
-        end
-        -- reset var to current running routine
-        opts.__co = opts.__coroutinify and coroutine.running()
-
-        -- callback with newline
-        local on_write_nl = function(data, cb)
-          data = data and tostring(data) .. EOL or nil
-          return on_write(data, cb)
-        end
-
-        -- callback with newline and coroutine
-        local on_write_nl_co = function(data, cb)
-          data = data and tostring(data) .. EOL or nil
-          return on_write(data, cb, opts.__co)
-        end
-
-        -- callback with coroutine (no NL)
-        local on_write_co = function(data, cb)
-          return on_write(data, cb, opts.__co)
-        end
-
-
-        if type(contents) == "table" then
-          for _, l in ipairs(contents) do
-            on_write_nl_co(l)
-          end
-          on_finish()
-        elseif type(contents) == "function" then
-          -- by default we use sync callbacks
-          if opts.__coroutinify then
-            contents(on_write_nl_co, on_write_co, unpack(args))
-          else
-            contents(on_write_nl, on_write, unpack(args))
-          end
-        else
-        end
+      -- callback with newline
+      local on_write_nl = function(data, cb)
+        data = data and tostring(data) .. EOL or nil
+        return on_write(data, cb)
       end
-      if opts.__coroutinify then
-        fn_load = coroutine.wrap(fn_load)
+
+      if type(contents) == "table" then
+        vim.tbl_map(function(x) on_write_nl(x) end, contents)
+        on_finish()
+      elseif type(contents) == "function" then
+        contents(on_write_nl, on_write, unpack(args))
       end
-      fn_load()
     end
   end, fzf_field_index or "", opts.debug)
 
